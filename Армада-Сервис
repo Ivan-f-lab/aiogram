@@ -1,0 +1,207 @@
+import os
+import sqlite3
+from aiogram import Bot, Dispatcher, types
+from aiogram.contrib.fsm_storage.memory import MemoryStorage
+from aiogram.dispatcher import FSMContext
+from aiogram.dispatcher.filters.state import State, StatesGroup
+from aiogram.utils import executor
+from dotenv import load_dotenv
+import requests
+from datetime import datetime
+
+# Загрузка переменных окружения
+load_dotenv()
+
+# Инициализация бота
+bot = Bot(token=os.getenv('BOT_TOKEN'))
+storage = MemoryStorage()
+dp = Dispatcher(bot, storage=storage)
+
+# Подключение к БД
+conn = sqlite3.connect('bot_database.db')
+cursor = conn.cursor()
+
+# Создание таблиц
+cursor.execute('''
+CREATE TABLE IF NOT EXISTS users (
+    user_id INTEGER PRIMARY KEY,
+    username TEXT,
+    full_name TEXT,
+    phone TEXT,
+    balance REAL DEFAULT 0,
+    tariff TEXT,
+    registration_date TEXT
+)''')
+
+cursor.execute('''
+CREATE TABLE IF NOT EXISTS orders (
+    order_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER,
+    service_type TEXT,
+    amount REAL,
+    status TEXT,
+    date TEXT,
+    FOREIGN KEY (user_id) REFERENCES users (user_id)
+)''')
+
+cursor.execute('''
+CREATE TABLE IF NOT EXISTS products (
+    product_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT,
+    description TEXT,
+    price REAL,
+    photo_id TEXT
+)''')
+
+conn.commit()
+
+# States для FSM
+class Form(StatesGroup):
+    waiting_for_payment_amount = State()
+    waiting_for_support_message = State()
+    waiting_for_product_quantity = State()
+
+# Клавиатуры
+def get_main_keyboard():
+    keyboard = types.ReplyKeyboardMarkup(resize_keyboard=True)
+    keyboard.add("📋 Услуги", "🛒 Магазин удобрений")
+    keyboard.add("💼 Личный кабинет", "❓ Помощь")
+    return keyboard
+
+def get_services_keyboard():
+    keyboard = types.ReplyKeyboardMarkup(resize_keyboard=True)
+    keyboard.add("🌿 Абонементное обслуживание", "🚗 Разовый выезд")
+    keyboard.add("🔙 Назад")
+    return keyboard
+
+def get_subscription_keyboard():
+    keyboard = types.InlineKeyboardMarkup()
+    keyboard.add(types.InlineKeyboardButton("Базовый (3000₽/мес)", callback_data="tariff_basic"))
+    keyboard.add(types.InlineKeyboardButton("Премиум (6000₽/мес)", callback_data="tariff_premium"))
+    keyboard.add(types.InlineKeyboardButton("VIP (10000₽/мес)", callback_data="tariff_vip"))
+    return keyboard
+
+def get_payment_keyboard():
+    keyboard = types.InlineKeyboardMarkup()
+    keyboard.add(types.InlineKeyboardButton("Оплатить картой Сбер", callback_data="pay_with_sber"))
+    return keyboard
+
+def get_account_keyboard():
+    keyboard = types.ReplyKeyboardMarkup(resize_keyboard=True)
+    keyboard.add("💰 Пополнить баланс", "📊 История заказов")
+    keyboard.add("🆘 Поддержка", "🔙 Назад")
+    return keyboard
+
+# Хендлеры
+@dp.message_handler(commands=['start'])
+async def cmd_start(message: types.Message):
+    user_id = message.from_user.id
+    username = message.from_user.username
+    full_name = message.from_user.full_name
+    reg_date = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    
+    cursor.execute("INSERT OR IGNORE INTO users (user_id, username, full_name, registration_date) VALUES (?, ?, ?, ?)", 
+                  (user_id, username, full_name, reg_date))
+    conn.commit()
+    
+    await message.answer(
+        "🏡 Добро пожаловать в сервис по уходу за загородными участками и магазин Буйских удобрений!",
+        reply_markup=get_main_keyboard()
+    )
+
+@dp.message_handler(text="📋 Услуги")
+async def services_menu(message: types.Message):
+    await message.answer("Выберите тип услуги:", reply_markup=get_services_keyboard())
+
+@dp.message_handler(text="🌿 Абонементное обслуживание")
+async def subscription_services(message: types.Message):
+    await message.answer("Выберите тарифный план:", reply_markup=get_subscription_keyboard())
+
+@dp.message_handler(text="💼 Личный кабинет")
+async def personal_account(message: types.Message):
+    user_id = message.from_user.id
+    cursor.execute("SELECT balance, tariff FROM users WHERE user_id = ?", (user_id,))
+    user_data = cursor.fetchone()
+    
+    if user_data:
+        balance, tariff = user_data
+        await message.answer(
+            f"👤 Ваш личный кабинет:\n"
+            f"▸ Тариф: {tariff if tariff else 'не выбран'}\n"
+            f"▸ Баланс: {balance}₽\n\n"
+            f"Выберите действие:",
+            reply_markup=get_account_keyboard()
+        )
+
+# Обработка оплаты через Сбер
+@dp.callback_query_handler(text="pay_with_sber")
+async def process_payment(callback: types.CallbackQuery):
+    # Здесь должна быть интеграция с API Сбера
+    payment_url = "https://paymentgateway.sberbank.ru/payment_url"  # Замените на реальный URL
+    
+    await bot.send_message(
+        callback.from_user.id,
+        f"Для оплаты перейдите по ссылке: {payment_url}\n"
+        f"После оплаты баланс будет пополнен автоматически.",
+        reply_markup=types.InlineKeyboardMarkup().add(
+            types.InlineKeyboardButton("Я оплатил", callback_data="check_payment")
+        )
+    )
+
+# Магазин удобрений
+@dp.message_handler(text="🛒 Магазин удобрений")
+async def fertilizer_shop(message: types.Message):
+    cursor.execute("SELECT * FROM products WHERE name LIKE '%Буйские%'")
+    products = cursor.fetchall()
+    
+    for product in products:
+        product_id, name, description, price, photo_id = product
+        caption = f"🌱 {name}\n\n{description}\n\nЦена: {price}₽"
+        
+        if photo_id:
+            await bot.send_photo(
+                message.from_user.id,
+                photo_id,
+                caption=caption,
+                reply_markup=types.InlineKeyboardMarkup().add(
+                    types.InlineKeyboardButton("Купить", callback_data=f"buy_{product_id}")
+                )
+            )
+        else:
+            await message.answer(
+                caption,
+                reply_markup=types.InlineKeyboardMarkup().add(
+                    types.InlineKeyboardButton("Купить", callback_data=f"buy_{product_id}")
+                )
+            )
+
+# FAQ
+@dp.message_handler(text="❓ Помощь")
+async def help_menu(message: types.Message):
+    faq_text = (
+        "❓ Часто задаваемые вопросы:\n\n"
+        "1. Как часто происходит обслуживание по абонементу?\n"
+        "   - 1-2 раза в месяц в зависимости от тарифа\n\n"
+        "2. Какие удобрения лучше для роз?\n"
+        "   - Рекомендуем Буйские удобрения 'Для розовых кустов'\n\n"
+        "3. Как пополнить баланс?\n"
+        "   - Через раздел 'Личный кабинет' -> 'Пополнить баланс'\n\n"
+        "4. Как связаться с поддержкой?\n"
+        "   - Нажмите кнопку 'Поддержка' в личном кабинете"
+    )
+    await message.answer(faq_text)
+
+# Интеграция с НПД
+async def send_self_employed_receipt(user_id, amount, description):
+    # Здесь должна быть интеграция с API "Мой Налог"
+    receipt_id = f"receipt_{user_id}_{datetime.now().timestamp()}"
+    return receipt_id
+
+# Запуск бота
+if __name__ == '__main__':
+    # Заполнение тестовыми данными
+    cursor.execute("INSERT OR IGNORE INTO products VALUES (1, 'Буйские удобрения для роз', 'Комплексное удобрение', 450, NULL)")
+    cursor.execute("INSERT OR IGNORE INTO products VALUES (2, 'Буйские удобрения для газона', 'Сезонное удобрение', 650, NULL)")
+    conn.commit()
+    
+    executor.start_polling(dp, skip_updates=True)
